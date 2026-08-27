@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import asyncio
+import json
+import logging
 from io import BytesIO
 from unittest import mock
 from unittest.mock import AsyncMock
@@ -24,6 +26,7 @@ from google.rpc import error_details_pb2, status_pb2
 
 from google.cloud import _storage_v2
 from google.cloud.storage.asyncio import async_read_object_stream
+from google.cloud.storage.asyncio import _read_stall_diagnostics as diagnostics
 from google.cloud.storage.asyncio.async_multi_range_downloader import (
     AsyncMultiRangeDownloader,
 )
@@ -223,6 +226,67 @@ class TestAsyncMultiRangeDownloader:
                 ]
             )
         )
+        assert buffer.getvalue() == data
+
+    @mock.patch(
+        "google.cloud.storage.asyncio.async_multi_range_downloader.generate_random_56_bit_integer"
+    )
+    @mock.patch(
+        "google.cloud.storage.asyncio.async_multi_range_downloader._AsyncReadObjectStream"
+    )
+    @pytest.mark.asyncio
+    async def test_download_ranges_observes_a_stalled_pending_read_wait(
+        self,
+        mock_cls_async_read_object_stream,
+        mock_random_int,
+        monkeypatch,
+        caplog,
+    ):
+        data = b"data"
+        mock_mrd, _ = await self._make_mock_mrd(mock_cls_async_read_object_stream)
+        mock_random_int.return_value = 456
+        mock_mrd.read_obj_str.send = AsyncMock()
+        recv_calls = 0
+
+        async def delayed_recv():
+            nonlocal recv_calls
+            recv_calls += 1
+            if recv_calls == 1:
+                await asyncio.sleep(0.035)
+                return _storage_v2.BidiReadObjectResponse(
+                    object_data_ranges=[
+                        _storage_v2.ObjectRangeData(
+                            checksummed_data=_storage_v2.ChecksummedData(
+                                content=data, crc32c=google_crc32c.value(data)
+                            ),
+                            range_end=True,
+                            read_range=_storage_v2.ReadRange(
+                                read_offset=0, read_length=4, read_id=456
+                            ),
+                        )
+                    ]
+                )
+            await asyncio.Event().wait()
+
+        mock_mrd.read_obj_str.recv = AsyncMock(side_effect=delayed_recv)
+        monkeypatch.setattr(diagnostics, "ENABLED", True)
+        monkeypatch.setattr(diagnostics, "WAIT_LOG_INTERVAL_SECONDS", 0.01)
+
+        with caplog.at_level(logging.WARNING):
+            buffer = BytesIO()
+            await mock_mrd.download_ranges([(0, 4, buffer)])
+
+        records = [
+            json.loads(record.message[len(diagnostics.MARKER) :])
+            for record in caplog.records
+            if record.message.startswith(diagnostics.MARKER)
+        ]
+        waits = [record for record in records if record["event"] == "wait_stalled"]
+        assert waits
+        assert waits[0]["operation"] == "download.queue_get"
+        assert waits[0]["pending_read_ids"] == 1
+        assert waits[0]["recv_task_state"] == "pending"
+        assert waits[0]["registered_read_ids"] == 1
         assert buffer.getvalue() == data
 
     @pytest.mark.asyncio

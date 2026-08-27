@@ -13,12 +13,15 @@
 # limitations under the License.
 
 import asyncio
+import json
+import logging
 from unittest.mock import AsyncMock
 
 import grpc
 import pytest
 
 from google.cloud import _storage_v2
+from google.cloud.storage.asyncio import _read_stall_diagnostics as diagnostics
 from google.cloud.storage.asyncio._stream_multiplexer import (
     _DEFAULT_QUEUE_MAX_SIZE,
     _StreamEnd,
@@ -64,6 +67,33 @@ class TestStreamMultiplexerInit:
 
         # Then it sets the custom queue size
         assert mux._queue_max_size == 50
+
+    def test_diagnostic_state_is_bounded_and_exposes_recv_progress(self):
+        mock_stream = AsyncMock()
+        mux = _StreamMultiplexer(mock_stream, queue_max_size=50)
+        queue = mux.register({1, 2, 3})
+        queue.put_nowait("response")
+
+        state = mux.diagnostic_state()
+
+        assert state == {
+            "multiplexer_id": mux._diagnostic_id,
+            "stream_generation": 0,
+            "registered_read_ids": 3,
+            "unique_queues": 1,
+            "queue_depth_total": 1,
+            "queue_depth_max": 1,
+            "queue_capacity": 50,
+            "recv_task_state": "not_started",
+            "recv_count": 0,
+            "response_range_count": 0,
+            "range_end_count": 0,
+            "send_count": 0,
+            "last_event": "register",
+            "last_event_age_s": pytest.approx(0, abs=0.1),
+            "last_response_age_s": None,
+            "last_recv_error_type": None,
+        }
 
 
 def _make_response(read_id, data=b"data", range_end=False):
@@ -392,6 +422,35 @@ class TestSend:
         # Then the exception is propagated
         with pytest.raises(RuntimeError, match="send failed"):
             await mux.send(_storage_v2.BidiReadObjectRequest())
+
+    @pytest.mark.asyncio
+    async def test_send_observes_a_stalled_stream_write(self, monkeypatch, caplog):
+        mock_stream = AsyncMock()
+        mock_stream.recv = AsyncMock(side_effect=asyncio.Event().wait)
+
+        async def delayed_send(request):
+            await asyncio.sleep(0.035)
+
+        mock_stream.send = AsyncMock(side_effect=delayed_send)
+        mux = _StreamMultiplexer(mock_stream)
+        monkeypatch.setattr(diagnostics, "ENABLED", True)
+        monkeypatch.setattr(diagnostics, "WAIT_LOG_INTERVAL_SECONDS", 0.01)
+
+        with caplog.at_level(logging.WARNING):
+            await mux.send(_storage_v2.BidiReadObjectRequest())
+
+        records = [
+            json.loads(record.message[len(diagnostics.MARKER) :])
+            for record in caplog.records
+            if record.message.startswith(diagnostics.MARKER)
+        ]
+        waits = [record for record in records if record["event"] == "wait_stalled"]
+        assert waits
+        assert waits[0]["operation"] == "multiplexer.send"
+        assert waits[0]["recv_task_state"] == "pending"
+        assert waits[0]["send_count"] == 1
+
+        await mux.close()
 
 
 class TestReopenStream:

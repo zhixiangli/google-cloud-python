@@ -24,6 +24,7 @@ from google.api_core.retry_async import AsyncRetry
 
 from google.cloud import _storage_v2
 from google.cloud.storage._helpers import generate_random_56_bit_integer
+from google.cloud.storage.asyncio import _read_stall_diagnostics as diagnostics
 from google.cloud.storage.asyncio._stream_multiplexer import (
     _StreamEnd,
     _StreamError,
@@ -464,6 +465,13 @@ class AsyncMultiRangeDownloader:
                         logger.info(
                             f"Resuming download (attempt {attempt_count}) for {len(requests)} ranges."
                         )
+                        diagnostics.emit(
+                            "download_retry",
+                            attempt=attempt_count,
+                            requested_ranges=len(requests),
+                            pending_read_ids=len(requests),
+                            **diagnostics.multiplexer_state(self._multiplexer),
+                        )
 
                     # Reopen stream if needed
                     should_reopen = (
@@ -498,11 +506,26 @@ class AsyncMultiRangeDownloader:
 
                     # Receive Responses
                     while pending_read_ids:
-                        item = await queue.get()
+                        async with diagnostics.observe_wait(
+                            "download.queue_get",
+                            snapshot=lambda: diagnostics.multiplexer_state(
+                                self._multiplexer
+                            ),
+                            attempt=attempt_count,
+                            pending_read_ids=len(pending_read_ids),
+                            requested_ranges=len(requests),
+                        ):
+                            item = await queue.get()
 
                         if isinstance(item, _StreamEnd):
                             if pending_read_ids:
                                 last_broken_generation = stream_generation
+                                diagnostics.emit(
+                                    "stream_end_with_pending_reads",
+                                    attempt=attempt_count,
+                                    pending_read_ids=len(pending_read_ids),
+                                    **diagnostics.multiplexer_state(self._multiplexer),
+                                )
                                 raise exceptions.ServiceUnavailable(
                                     "Stream ended with pending read_ids"
                                 )
@@ -512,6 +535,15 @@ class AsyncMultiRangeDownloader:
                             if item.generation < stream_generation:
                                 continue  # stale error, skip
                             last_broken_generation = item.generation
+                            diagnostics.emit(
+                                "download_stream_error",
+                                attempt=attempt_count,
+                                pending_read_ids=len(pending_read_ids),
+                                error_type=type(item.exception).__name__,
+                                error=str(item.exception),
+                                error_generation=item.generation,
+                                **diagnostics.multiplexer_state(self._multiplexer),
+                            )
                             raise item.exception
 
                         # Track completion
